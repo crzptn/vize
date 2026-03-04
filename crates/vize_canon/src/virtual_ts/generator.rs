@@ -94,7 +94,8 @@ pub fn generate_virtual_ts_with_offsets(
     ts.push_str(IMPORT_META_AUGMENTATION);
     ts.push('\n');
 
-    // Vue type alias (shorthand for import('vue') references)
+    // Vue type alias (shorthand for import('vue') type references).
+    // Requires node_modules/vue to be resolvable (symlinked in temp dir).
     ts.push_str("type $Vue = import('vue');\n\n");
 
     // Module scope: Extract imports, re-exports, and type declarations to module level.
@@ -146,6 +147,23 @@ pub fn generate_virtual_ts_with_offsets(
 
     // Auto-import stubs (e.g., Nuxt composables)
     // Only emit stubs for names NOT already declared via imports or bindings.
+    // Collect imported names from all module-level import statements to handle
+    // cases where plain <script> imports are not in summary.bindings (which
+    // only holds <script setup> bindings when both blocks exist).
+    let imported_names: Vec<&str> = if let Some(script) = script_content {
+        summary
+            .import_statements
+            .iter()
+            .flat_map(|imp| {
+                let text = script
+                    .get(imp.start as usize..imp.end as usize)
+                    .unwrap_or("");
+                extract_import_names(text)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if !options.auto_import_stubs.is_empty() {
         let mut has_header = false;
         for stub in &options.auto_import_stubs {
@@ -156,7 +174,7 @@ pub fn generate_virtual_ts_with_offsets(
             });
             if let Some(name) = name {
                 // Skip if already imported or declared in script bindings
-                if summary.bindings.bindings.contains_key(name) {
+                if summary.bindings.bindings.contains_key(name) || imported_names.contains(&name) {
                     continue;
                 }
             }
@@ -187,7 +205,10 @@ pub fn generate_virtual_ts_with_offsets(
     if let Some(script) = script_content {
         ts.push_str("  // User setup code\n");
         let script_gen_start = ts.len();
-        let lines: Vec<&str> = script.lines().collect();
+        // Use split('\n') to correctly track byte offsets for CRLF files.
+        // Rust's lines() strips \r from CRLF but +1 for \n undercounts,
+        // causing src_byte_offset drift that incorrectly skips user code.
+        let raw_lines: Vec<&str> = script.split('\n').collect();
         let mut src_byte_offset: usize = 0; // offset within script content
 
         // Check if script uses import.meta and add a polyfill variable.
@@ -197,15 +218,20 @@ pub fn generate_virtual_ts_with_offsets(
             ts.push_str("  const __import_meta: any = {};\n");
         }
 
-        for line in lines.iter() {
+        for raw_line in raw_lines.iter() {
+            // Strip trailing \r for output (normalize CRLF to LF)
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            // raw_line.len() includes \r if present; +1 for the \n from split
+            let raw_byte_len = raw_line.len() + 1;
+
             // Skip lines that overlap with module-level spans (imports, re-exports, type decls)
             let line_start = src_byte_offset;
-            let line_end = line_start + line.len();
+            let line_end = line_start + raw_line.len(); // use raw length for span check
             let is_module_level = module_spans
                 .iter()
                 .any(|&(s, e)| line_start < e as usize && line_end > s as usize);
             if is_module_level {
-                src_byte_offset += line.len() + 1; // +1 for newline
+                src_byte_offset += raw_byte_len;
                 continue;
             }
             let gen_line_start = ts.len();
@@ -214,7 +240,7 @@ pub fn generate_virtual_ts_with_offsets(
 
             // Process the line: strip `export` keyword (invalid inside function),
             // replace import.meta with polyfill variable
-            let mut output_line = std::borrow::Cow::Borrowed(*line);
+            let mut output_line = std::borrow::Cow::Borrowed(line);
 
             // Strip `export` from non-import lines inside setup scope
             let trimmed_line = output_line.trim_start();
@@ -253,7 +279,7 @@ pub fn generate_virtual_ts_with_offsets(
                 });
             }
             let _ = gen_line_start; // suppress unused warning
-            src_byte_offset += line.len() + 1; // +1 for newline
+            src_byte_offset += raw_byte_len;
         }
         let script_gen_end = ts.len();
         append!(
@@ -281,20 +307,23 @@ pub fn generate_virtual_ts_with_offsets(
         if !ref_bindings.is_empty() {
             ts.push_str("  // Ref type captures (before template scope shadows them)\n");
             for name in &ref_bindings {
-                append!(ts, "  type __VizeRef_{name} = typeof {name};\n");
+                append!(ts, "  type __Ref_{name} = typeof {name};\n");
             }
         }
 
-        ts.push_str("  (function __template() {\n");
+        // Semicolon prevents ASI issues when user script doesn't end with `;`
+        // (e.g., `console.log(x)\n(function...)` would be parsed as a call)
+        ts.push_str("  ;(function __template() {\n");
 
         // Shadow ref bindings with unwrapped types.
         // `var` allows reassignment (Vue templates can assign to refs).
         if !ref_bindings.is_empty() {
             ts.push_str("    // Auto-unwrap refs (Vue template behavior)\n");
+            ts.push_str("    type __UnwrapRef<T> = import('vue').UnwrapRef<T>;\n");
             for name in &ref_bindings {
                 append!(
                     ts,
-                    "    var {name}: $Vue['UnwrapRef']<__VizeRef_{name}> = undefined as any;\n"
+                    "    var {name}: __UnwrapRef<__Ref_{name}> = undefined as any;\n"
                 );
             }
         }
@@ -425,12 +454,29 @@ pub fn generate_virtual_ts_with_offsets(
         }
     }
 
+    // Return exposed object from __setup() so its type can be extracted at module level.
+    // This keeps the runtime args expression in scope (where the bindings are defined).
+    let has_runtime_expose = summary
+        .macros
+        .define_expose()
+        .is_some_and(|e| e.type_args.is_none() && e.runtime_args.is_some());
+    if has_runtime_expose {
+        let runtime_args = summary
+            .macros
+            .define_expose()
+            .unwrap()
+            .runtime_args
+            .as_ref()
+            .unwrap();
+        append!(ts, "\n  return ({runtime_args});\n");
+    }
+
     // Close setup function
     ts.push_str("}\n\n");
 
-    // Invoke setup
+    // Invoke setup (void suppresses TS2349 for async/generic functions)
     ts.push_str("// Invoke setup to verify types\n");
-    ts.push_str("__setup();\n\n");
+    ts.push_str("void __setup();\n\n");
 
     // Emits type
     let emits_already_defined = summary
@@ -464,8 +510,10 @@ pub fn generate_virtual_ts_with_offsets(
                 .and_then(|s| s.strip_suffix('>'))
                 .unwrap_or(type_args.as_str());
             append!(ts, "export type Exposed = {inner_type};\n");
-        } else if let Some(ref runtime_args) = expose.runtime_args {
-            append!(ts, "export type Exposed = typeof ({runtime_args});\n",);
+        } else if expose.runtime_args.is_some() {
+            // Runtime args are returned from __setup() to keep them in scope.
+            // Use Awaited<ReturnType<...>> to handle both sync and async setup.
+            ts.push_str("export type Exposed = Awaited<ReturnType<typeof __setup>>;\n");
         }
     }
     ts.push('\n');
@@ -480,4 +528,54 @@ pub fn generate_virtual_ts_with_offsets(
     ts.push_str("export default __vize_component__;\n");
 
     VirtualTsOutput { code: ts, mappings }
+}
+
+/// Extract imported identifier names from an import statement string.
+/// Handles `import { a, b as c } from "..."` and `import D from "..."`.
+/// Returns the local names (e.g., `["a", "c", "D"]`).
+fn extract_import_names(import_text: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+
+    // Find the content between { and }
+    if let Some(brace_start) = import_text.find('{') {
+        if let Some(brace_end) = import_text.find('}') {
+            let inner = &import_text[brace_start + 1..brace_end];
+            for part in inner.split(',') {
+                let part = part.trim();
+                if part.is_empty() || part.starts_with("//") || part.starts_with("type ") {
+                    continue;
+                }
+                // Handle "name as alias" -> use alias
+                if let Some(as_pos) = part.find(" as ") {
+                    let alias = part[as_pos + 4..].trim();
+                    if !alias.is_empty() {
+                        names.push(alias);
+                    }
+                } else {
+                    // Simple name (strip \r for CRLF files)
+                    let name = part.strip_suffix('\r').unwrap_or(part);
+                    if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+    } else {
+        // Handle `import Name from "..."`
+        let text = import_text.trim();
+        if let Some(rest) = text.strip_prefix("import ") {
+            if let Some(from_pos) = rest.find(" from ") {
+                let name = rest[..from_pos].trim();
+                if !name.is_empty()
+                    && !name.contains('{')
+                    && !name.contains('*')
+                    && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    names.push(name);
+                }
+            }
+        }
+    }
+
+    names
 }
